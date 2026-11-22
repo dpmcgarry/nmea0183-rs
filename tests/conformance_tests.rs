@@ -5,9 +5,9 @@
 
 use nmea::{Error, ParseResult, SENTENCE_MAX_LEN, SentenceType, parse_nmea_sentence, parse_str};
 
-mod helpers;
+mod sentence_builders;
 
-use helpers::{
+use sentence_builders::{
     build_ais_sentence, build_sentence, build_sentence_bad_checksum, build_truncated_sentence,
 };
 
@@ -257,7 +257,7 @@ mod sentence_length_tests {
         // Create fields of the right length: commas are valid NMEA field content.
         let fields: String = std::iter::repeat_n(',', fields_len).collect();
 
-        let body = format!("{}{}", body_for_checksum_prefix, &fields);
+        let body = format!("{}{}", body_for_checksum_prefix, fields);
         let cs = body.as_bytes().iter().fold(0u8, |c, x| c ^ x);
         let sentence = format!("{}{}*{:02X}", prefix, fields, cs);
 
@@ -278,7 +278,7 @@ mod sentence_length_tests {
         let fields_len = (SENTENCE_MAX_LEN + 1) - prefix.len() - suffix_len;
         let fields: String = std::iter::repeat_n(',', fields_len).collect();
 
-        let body = format!("{}{}", body_for_checksum_prefix, &fields);
+        let body = format!("{}{}", body_for_checksum_prefix, fields);
         let cs = body.as_bytes().iter().fold(0u8, |c, x| c ^ x);
         let sentence = format!("{}{}*{:02X}", prefix, fields, cs);
 
@@ -325,7 +325,7 @@ mod sentence_length_tests {
         let fields_len = (SENTENCE_MAX_LEN + 1) - prefix.len() - suffix_len;
         let fields: String = std::iter::repeat_n(',', fields_len).collect();
 
-        let body = format!("{}{}", body_for_checksum_prefix, &fields);
+        let body = format!("{}{}", body_for_checksum_prefix, fields);
         let cs = body.as_bytes().iter().fold(0u8, |c, x| c ^ x);
         let sentence = format!("{}{}*{:02X}", prefix, fields, cs);
 

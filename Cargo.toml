@@ -3,7 +3,7 @@ members = [".", "benches-harness"]
 
 [package]
 name = "nmea"
-version = "0.7.0"
+version = "0.8.0"
 
 authors = [
   "Felix Obenhuber <felix@obenhuber.de>",
@@ -23,7 +23,7 @@ readme = "README.md"
 
 edition = "2024"
 # Update README.md and ci.yml when updating the MSRV!
-rust-version = "1.87.0"
+rust-version = "1.88.0"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -40,7 +40,7 @@ nom = { version = "8", default-features = false }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 cfg-if = "1"
 serde = { version = "1.0", default-features = false, optional = true }
-serde_with = { version = "~3.11", default-features = false, optional = true }
+serde_with = { version = "3", default-features = false, optional = true }
 
 defmt = { version = "1", optional = true }
 document-features = { version = "0.2", optional = true }
@@ -50,6 +50,7 @@ approx = "0.5"
 doc-comment = "0.3"
 pretty_assertions = "1"
 quickcheck = { version = "1", default-features = false }
+proptest = "1"
 serde_json = "1.0"
 
 [features]

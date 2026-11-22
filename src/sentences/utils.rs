@@ -5,10 +5,9 @@ use chrono::{Duration, NaiveDate, NaiveTime};
 use nom::{
     IResult, Parser as _,
     branch::alt,
-    bytes::complete::{tag, take, take_until, take_while},
+    bytes::complete::{tag, take, take_until, take_while, take_while_m_n},
     character::complete::{char, digit1, one_of},
-    combinator::{all_consuming, eof, map, map_parser, map_res},
-    number::complete::{double, float},
+    combinator::{all_consuming, eof, map, map_parser, map_res, opt, recognize},
     sequence::terminated,
 };
 
@@ -17,15 +16,19 @@ use nom::{
 use num_traits::float::FloatCore;
 
 use crate::Error;
+use crate::sentences::float::{float32, float64, parse_f64};
 
 pub fn parse_hms(i: &str) -> IResult<&str, NaiveTime> {
     map_res(
         (
             map_res(take(2usize), parse_num::<u32>),
             map_res(take(2usize), parse_num::<u32>),
-            map_parser(take_until(","), double),
+            map_parser(take_until(","), all_consuming(float64)),
         ),
         |(hour, minutes, sec)| -> core::result::Result<NaiveTime, &'static str> {
+            if !sec.is_finite() {
+                return Err("Invalid time: second is not finite");
+            }
             if sec.is_sign_negative() {
                 return Err("Invalid time: second is negative");
             }
@@ -63,7 +66,7 @@ pub fn parse_duration_hms(i: &str) -> IResult<&str, Duration> {
         (
             map_res(take(2usize), parse_num::<u8>),
             map_res(take(2usize), parse_num::<u8>),
-            map_parser(take_until(","), float),
+            map_parser(take_until(","), all_consuming(float32)),
         ),
         |(hours, minutes, seconds)| -> core::result::Result<Duration, &'static str> {
             if hours >= 24 {
@@ -96,26 +99,56 @@ pub fn parse_duration_hms(i: &str) -> IResult<&str, Duration> {
 }
 
 pub fn do_parse_lat_lon(i: &str) -> IResult<&str, (f64, f64)> {
-    let (i, lat_deg) = map_res(take(2usize), parse_num::<u8>).parse(i)?;
-    let (i, lat_min) = double(i)?;
+    let (i, lat) = parse_coordinate(i, CoordinateAxis::Latitude)?;
     let (i, _) = char(',').parse(i)?;
     let (i, lat_dir) = one_of("NS").parse(i)?;
     let (i, _) = char(',').parse(i)?;
-    let (i, lon_deg) = map_res(take(3usize), parse_num::<u8>).parse(i)?;
-    let (i, lon_min) = double(i)?;
+    let (i, lon) = parse_coordinate(i, CoordinateAxis::Longitude)?;
     let (i, _) = char(',').parse(i)?;
     let (i, lon_dir) = one_of("EW").parse(i)?;
 
-    let mut lat = f64::from(lat_deg) + lat_min / 60.;
-    if lat_dir == 'S' {
-        lat = -lat;
-    }
-    let mut lon = f64::from(lon_deg) + lon_min / 60.;
-    if lon_dir == 'W' {
-        lon = -lon;
-    }
+    Ok((
+        i,
+        (
+            if lat_dir == 'S' { -lat } else { lat },
+            if lon_dir == 'W' { -lon } else { lon },
+        ),
+    ))
+}
 
-    Ok((i, (lat, lon)))
+#[derive(Clone, Copy)]
+enum CoordinateAxis {
+    Latitude,
+    Longitude,
+}
+
+fn parse_coordinate(i: &str, axis: CoordinateAxis) -> IResult<&str, f64> {
+    let (degree_digits, maximum_degrees) = match axis {
+        CoordinateAxis::Latitude => (2, 90),
+        CoordinateAxis::Longitude => (3, 180),
+    };
+    let decimal_digits =
+        |count| take_while_m_n(count, count, |character: char| character.is_ascii_digit());
+    map_res(
+        (
+            map_res(decimal_digits(degree_digits), parse_num::<u16>),
+            recognize((decimal_digits(2), opt((char('.'), digit1)))),
+        ),
+        |(degrees, minutes)| {
+            let (whole_minutes, fraction) = minutes.split_once('.').unwrap_or((minutes, ""));
+            let whole_minutes = parse_num::<u8>(whole_minutes)?;
+            if degrees > maximum_degrees
+                || whole_minutes >= 60
+                || (degrees == maximum_degrees
+                    && (whole_minutes != 0 || fraction.bytes().any(|byte| byte != b'0')))
+            {
+                return Err("Invalid geographic coordinate");
+            }
+            let minutes = parse_f64(minutes)?;
+            Ok(f64::from(degrees) + minutes / 60.0)
+        },
+    )
+    .parse(i)
 }
 
 /// Parses the variation between magnetic north and true north.
@@ -126,7 +159,7 @@ pub fn do_parse_lat_lon(i: &str) -> IResult<&str, (f64, f64)> {
 /// "14.2,E" => 14.2 <br>
 /// "14.2,W" => -14.2 <br>
 pub fn do_parse_magnetic_variation(i: &str) -> IResult<&str, f32> {
-    let (i, variation_deg) = float(i)?;
+    let (i, variation_deg) = float32(i)?;
     let (i, _) = char(',').parse(i)?;
     let (i, direction) = one_of("EW").parse(i)?;
     let variation_deg = match direction {
@@ -184,10 +217,6 @@ pub(crate) fn parse_date(i: &str) -> IResult<&str, NaiveDate> {
 
 pub(crate) fn parse_num<I: str::FromStr>(data: &str) -> Result<I, &'static str> {
     data.parse::<I>().map_err(|_| "parse of number failed")
-}
-
-pub(crate) fn parse_float_num<T: str::FromStr>(input: &str) -> Result<T, &'static str> {
-    str::parse::<T>(input).map_err(|_| "parse of float number failed")
 }
 
 pub(crate) fn number<T: str::FromStr>(i: &str) -> IResult<&str, T> {
@@ -367,51 +396,55 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_float_num() {
-        let result = parse_float_num::<f32>("12.5");
-        assert!(result.is_ok());
-        let result = parse_float_num::<f32>("12");
-        assert!(result.is_ok());
-
-        let result = parse_float_num::<f32>("12.5.5");
-        let err_expected = "parse of float number failed";
-        assert_eq!(result, Err(err_expected));
-    }
-
-    #[test]
     fn test_parse_lat_lon() {
-        let (_, lat_lon) = parse_lat_lon("4807.038,N,01131.324,E").unwrap();
-        assert!(lat_lon.is_some());
-        let (_, lat_lon) = parse_lat_lon(",,,,").unwrap();
-        assert!(lat_lon.is_none());
+        assert_eq!(
+            parse_lat_lon("4807.038,N,01131.324,E"),
+            Ok(("", Some((48. + 7.038 / 60., 11. + 31.324 / 60.))))
+        );
+        assert_eq!(parse_lat_lon(",,,,"), Ok((",", None)));
 
         let lat_lon = parse_lat_lon("51.5074,0.1278");
-        let err_expected = nom::error::Error::new("0.1278", nom::error::ErrorKind::OneOf);
+        let err_expected =
+            nom::error::Error::new(".5074,0.1278", nom::error::ErrorKind::TakeWhileMN);
         let err = lat_lon.unwrap_err();
         assert_eq!(err, nom::Err::Error(err_expected));
 
-        let lat_lon = parse_lat_lon("1234.567,N,09876.543,W");
-        assert!(lat_lon.is_ok());
+        let lat_lon = parse_lat_lon("1234.567,N,09846.543,W");
+        assert_eq!(
+            lat_lon,
+            Ok(("", Some((12. + 34.567 / 60., -(98. + 46.543 / 60.)))))
+        );
 
         let lat_lon = parse_lat_lon("0000.000,S,00000.000,E");
-        assert!(lat_lon.is_ok());
+        assert_eq!(lat_lon, Ok(("", Some((-0.0, 0.0)))));
 
-        let lat_lon = parse_lat_lon("1234.567,S,09876.543,E");
-        assert!(lat_lon.is_ok());
+        let lat_lon = parse_lat_lon("1234.567,S,09846.543,E");
+        assert_eq!(
+            lat_lon,
+            Ok(("", Some((-(12. + 34.567 / 60.), 98. + 46.543 / 60.))))
+        );
 
-        let lat_lon = parse_lat_lon("1234.567,S,09876.543,E");
-        assert!(lat_lon.is_ok());
+        let lat_lon = parse_lat_lon("1234.567,S,09846.543,E");
+        assert_eq!(
+            lat_lon,
+            Ok(("", Some((-(12. + 34.567 / 60.), 98. + 46.543 / 60.))))
+        );
 
-        let lat_lon = parse_lat_lon("40.7128,");
-        assert!(lat_lon.is_err());
+        assert_eq!(
+            parse_lat_lon("40.7128,"),
+            Err(nom::Err::Error(nom::error::Error::new(
+                ".7128,",
+                nom::error::ErrorKind::TakeWhileMN
+            )))
+        );
 
         let lat_lon = parse_lat_lon(", -74.0060");
-        let err_expected = nom::error::Error::new(", -74.0060", nom::error::ErrorKind::MapRes);
+        let err_expected = nom::error::Error::new(", -74.0060", nom::error::ErrorKind::TakeWhileMN);
         let err = lat_lon.unwrap_err();
         assert_eq!(err, nom::Err::Error(err_expected));
 
         let lat_lon = parse_lat_lon("abc,def");
-        let err_expected = nom::error::Error::new("abc,def", nom::error::ErrorKind::MapRes);
+        let err_expected = nom::error::Error::new("abc,def", nom::error::ErrorKind::TakeWhileMN);
         let err = lat_lon.unwrap_err();
         assert_eq!(err, nom::Err::Error(err_expected));
     }

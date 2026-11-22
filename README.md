@@ -104,7 +104,7 @@ Add the `nmea` dependency in your `Cargo.toml`:
 
 ```toml
 [dependencies]
-nmea = "0.7"
+nmea = "0.8"
 ```
 
 ### For `no_std`
@@ -114,17 +114,30 @@ just add the `nmea` crate without the default features:
 
 ```toml
 [dependencies]
-nmea = { version = "0.7", default-features = false }
+nmea = { version = "0.8", default-features = false }
 ```
 
 ### Parse
 
 To use the NMEA parser create a `Nmea` struct and feed it with NMEA sentences (only supports `GNSS` messages, otherwise use the `parse_str()` and `parse_bytes()`):
 
+There are 3 common ways to consume NMEA sentences, depending on how much
+RAM is available and whether state needs to be tracked across sentences:
+ 1. Keep a `Nmea` on the stack (below) - simplest, but `Nmea` buffers
+    satellite data for every supported GNSS constellation, so it can take
+    up a considerable amount of RAM (several kilobytes).
+ 2. Heap-allocate the `Nmea` (`Box::new(Nmea::default())`) - same stateful
+    API, but keeps that RAM off the stack; useful on stack-constrained
+    embedded targets that still have an allocator.
+ 3. Parse a single sentence without keeping any `Nmea` state at all, using
+    `parse_str()` / `parse_bytes()` (see the example below) - the
+    lightest option, at the cost of not tracking state across sentences.
+
 ```rust
 use nmea::Nmea;
 
 fn main() {
+    
     let mut nmea = Nmea::default();
     let gga = "$GPGGA,092750.000,5321.6802,N,00630.3372,W,1,8,1.03,61.7,M,55.2,M,,*76";
 
@@ -133,6 +146,25 @@ fn main() {
     {
         nmea.parse(gga).unwrap();
         println!("{}", nmea);
+    }
+}
+```
+
+Alternatively, parse a sentence on its own with `parse_str()` (or `parse_bytes()` for raw bytes) without keeping any `Nmea` state around:
+
+```rust
+use nmea::{parse_str, ParseResult};
+
+fn main() {
+    let gga = "$GPGGA,092750.000,5321.6802,N,00630.3372,W,1,8,1.03,61.7,M,55.2,M,,*76";
+
+    // feature `GGA` should be enabled to parse this sentence.
+    #[cfg(feature = "GGA")]
+    {
+        match parse_str(gga).unwrap() {
+            ParseResult::GGA(gga_data) => println!("{:?}", gga_data),
+            _ => unreachable!(),
+        }
     }
 }
 ```
@@ -155,7 +187,7 @@ fn main() {
 
 ## Supported Rust Versions
 
-The Minimum supported Rust version (or MSRV) is **1.87.0**.
+The Minimum supported Rust version (or MSRV) is **1.88.0**.
 
 ## Unsafe-free crate
 

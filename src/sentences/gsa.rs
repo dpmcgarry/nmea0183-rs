@@ -4,13 +4,21 @@ use nom::{
     branch::alt,
     bytes::complete::take_while1,
     character::complete::{char, one_of},
-    combinator::{all_consuming, opt, value},
+    combinator::{all_consuming, map_res, opt},
     error::{ErrorKind, ParseError},
-    number::complete::float,
-    sequence::terminated,
+    sequence::{preceded, terminated},
 };
 
-use crate::{Error, SentenceType, parse::NmeaSentence, sentences::utils::number};
+use crate::{
+    Error, SentenceType,
+    parse::NmeaSentence,
+    sentences::{gnss_type::GnssSystemId, utils::number},
+};
+
+/// Satellites used for the current fix, accumulated across all GSA sentences
+/// in a cycle. Sized to accommodate all supported constellations + 10 for headroom:
+/// GPS(12) + GLONASS(12) + Galileo(14) + BeiDou(12) + QZSS/SBAS(12) = 62 + 10
+pub const MAX_PRNS: usize = 72;
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -34,24 +42,36 @@ pub enum GsaMode2 {
 /// <https://gpsd.gitlab.io/gpsd/NMEA.html#_gsa_gps_dop_and_active_satellites>
 ///
 /// ```text
-///        1 2 3                        14 15  16  17  18 19
-///        | | |                         |  |   |   |   |  |
+///        1 2 3                        14 15  16  17 18 19
+///        | | |                         |  |   |   |  |  |
 /// $--GSA,a,a,x,x,x,x,x,x,x,x,x,x,x,x,x,x,x.x,x.x,x.x,x*hh<CR><LF>
 /// ```
 ///
-/// Field 19 (NMEA 4.1+): System ID — 1=GPS, 2=GLONASS, 3=Galileo, 4=BDS
+/// Field 18: System ID (NMEA 4.1+):
+///
+/// 1 = GPS L1C/A, L2CL, L2CM
+/// 2 = GLONASS L1 OF, L2 OF
+/// 3 = Galileo E1C, E1B, E5 bl, E5 bQ
+/// 4 = BeiDou B1I D1, B1I D2, B2I D1, B2I D12
+/// 5 = QZSS (NMEA 4.11)
+/// 6 = NavIC (NMEA 4.11)
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct GsaData {
     pub mode1: GsaMode1,
     pub mode2: GsaMode2,
-    pub fix_sats_prn: Vec<u32, 18>,
+    pub fix_sats_prn: Vec<u32, MAX_PRNS>,
     pub pdop: Option<f32>,
     pub hdop: Option<f32>,
     pub vdop: Option<f32>,
-    /// NMEA 4.1+ System ID: 1=GPS, 2=GLONASS, 3=Galileo, 4=BDS
-    pub system_id: Option<u8>,
+    /// NMEA 4.1+ System ID: 1=GPS, 2=GLONASS, 3=Galileo, 4=BDS, 5=QZSS, 6=NavIC.
+    /// Inferred from a recognized talker when the trailing System ID is absent.
+    pub system_id: Option<GnssSystemId>,
+    /// Two-character talker ID from the sentence header, e.g. `"GP"`, `"GL"`, `"GN"`.
+    /// Used to detect GSA cycle boundaries: a repeated talker signals a new cycle,
+    /// except for `"GN"` and `"PQ"` which emit one GSA per constellation and always accumulate.
+    pub talker_id: heapless::String<2>,
 }
 
 /// This function is take from `nom`, see `nom::multi::many0` (requires `alloc`)
@@ -114,32 +134,45 @@ where
     }
 }
 
-fn gsa_prn_fields_parse(i: &str) -> IResult<&str, Vec<Option<u32>, 18>> {
-    many0(terminated(opt(number::<u32>), char(','))).parse(i)
+fn gsa_prn_fields_parse(mut i: &str) -> IResult<&str, Vec<Option<u32>, MAX_PRNS>> {
+    let mut prns = Vec::new();
+    loop {
+        match terminated(opt(number::<u32>), char(',')).parse(i) {
+            Ok((remaining, prn)) => {
+                prns.push(prn)
+                    .map_err(|_| Err::Failure(nom::error::Error::new(i, ErrorKind::TooLarge)))?;
+                i = remaining;
+            }
+            Err(Err::Error(_)) => return Ok((i, prns)),
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 type GsaTail = (
-    Vec<Option<u32>, 18>,
+    Vec<Option<u32>, MAX_PRNS>,
     Option<f32>,
     Option<f32>,
     Option<f32>,
-    Option<u8>,
+    Option<GnssSystemId>,
 );
 
 fn do_parse_gsa_tail(i: &str) -> IResult<&str, GsaTail> {
     let (i, prns) = gsa_prn_fields_parse(i)?;
-    let (i, pdop) = float(i)?;
+    let (i, pdop) = crate::sentences::float::float32(i)?;
     let (i, _) = char(',').parse(i)?;
-    let (i, hdop) = float(i)?;
+    let (i, hdop) = crate::sentences::float::float32(i)?;
     let (i, _) = char(',').parse(i)?;
-    let (i, vdop) = float(i)?;
-    // NMEA 4.1+: optional System ID field
-    let (i, system_id) = opt(|i| {
-        let (i, _) = char(',').parse(i)?;
-        number::<u8>(i)
-    })
+    let (i, vdop) = crate::sentences::float::float32(i)?;
+
+    // Optionally parse the system ID if it exists at the end
+    let (i, sys_id) = opt(preceded(
+        char(','),
+        map_res(number::<u8>, GnssSystemId::try_from),
+    ))
     .parse(i)?;
-    Ok((i, (prns, Some(pdop), Some(hdop), Some(vdop), system_id)))
+
+    Ok((i, (prns, Some(pdop), Some(hdop), Some(vdop), sys_id)))
 }
 
 fn is_comma(x: char) -> bool {
@@ -147,19 +180,23 @@ fn is_comma(x: char) -> bool {
 }
 
 fn do_parse_empty_gsa_tail(i: &str) -> IResult<&str, GsaTail> {
-    value(
-        (Vec::new(), None, None, None, None),
-        all_consuming(take_while1(is_comma)),
-    )
-    .parse(i)
+    // Consume all the empty commas
+    let (i, _) = take_while1(is_comma)(i)?;
+
+    // Optionally grab the system ID, ensuring there's no junk left over
+    let (i, system_id) =
+        all_consuming(opt(map_res(number::<u8>, GnssSystemId::try_from))).parse(i)?;
+
+    Ok((i, (Vec::new(), None, None, None, system_id)))
 }
 
-fn do_parse_gsa(i: &str) -> IResult<&str, GsaData> {
+fn do_parse_gsa(i: &str, talker_id: heapless::String<2>) -> IResult<&str, GsaData> {
     let (i, mode1) = one_of("MA").parse(i)?;
     let (i, _) = char(',').parse(i)?;
     let (i, mode2) = one_of("123").parse(i)?;
     let (i, _) = char(',').parse(i)?;
     let (i, mut tail) = alt((do_parse_empty_gsa_tail, do_parse_gsa_tail)).parse(i)?;
+
     Ok((
         i,
         GsaData {
@@ -175,12 +212,10 @@ fn do_parse_gsa(i: &str) -> IResult<&str, GsaData> {
                 _ => unreachable!(),
             },
             fix_sats_prn: {
-                let mut fix_sats_prn = Vec::<u32, 18>::new();
+                let mut fix_sats_prn = Vec::<u32, MAX_PRNS>::new();
                 for sat in tail.0.iter().flatten() {
                     let _ = fix_sats_prn.push(*sat);
                 }
-                // now that we don't have `drain()` from `std::Vec`,
-                // we clear the `heapless::Vec`'s tail manually
                 tail.0.clear();
                 fix_sats_prn
             },
@@ -188,6 +223,7 @@ fn do_parse_gsa(i: &str) -> IResult<&str, GsaData> {
             hdop: tail.2,
             vdop: tail.3,
             system_id: tail.4,
+            talker_id,
         },
     ))
 }
@@ -206,6 +242,11 @@ fn do_parse_gsa(i: &str) -> IResult<&str, GsaData> {
 /// 15   = PDOP
 /// 16   = HDOP
 /// 17   = VDOP
+/// 18   = Optional System ID, see [`GnssSystemId`].
+///
+/// Without a System ID, the constellation is inferred from `GP`, `GL`, `GA`,
+/// `BD`/`GB`, `GQ`/`QZ` or `GI`. Neither `GN` nor `PQ` implies a constellation.
+/// An explicit ID conflicting with the talker returns [`Error::SystemIdMismatch`].
 ///
 /// Not all documentation specifies the number of PRN fields, it
 /// may be variable. Most doc that specifies says 12 PRNs.
@@ -241,13 +282,43 @@ fn do_parse_gsa(i: &str) -> IResult<&str, GsaData> {
 /// Alarmingly, it's possible this error may be generic to SiRFstarIII
 pub fn parse_gsa(sentence: NmeaSentence<'_>) -> Result<GsaData, Error<'_>> {
     if sentence.message_id != SentenceType::GSA {
-        Err(Error::WrongSentenceHeader {
+        return Err(Error::WrongSentenceHeader {
             expected: SentenceType::GSA,
             found: sentence.message_id,
-        })
-    } else {
-        Ok(do_parse_gsa(sentence.data)?.1)
+        });
     }
+
+    // SAFETY: talker_id is always exactly 2 ASCII chars
+    let talker_id = heapless::String::<2>::try_from(sentence.talker_id).unwrap();
+
+    let (_, mut gsa_data) =
+        all_consuming(|input| do_parse_gsa(input, talker_id.clone())).parse(sentence.data)?;
+
+    // Derive system ID from the talker prefix
+    let system_id_from_talker = match sentence.talker_id {
+        "GA" => Some(GnssSystemId::Galileo),
+        "GP" => Some(GnssSystemId::Gps),
+        "GL" => Some(GnssSystemId::Glonass),
+        "BD" | "GB" => Some(GnssSystemId::Beidou),
+        "GQ" | "QZ" => Some(GnssSystemId::Qzss),
+        "GI" => Some(GnssSystemId::NavIC),
+        _ => None,
+    };
+
+    // Validation
+    if let (Some(talker_sys_id), Some(tail_sys_id)) = (system_id_from_talker, gsa_data.system_id)
+        && talker_sys_id != tail_sys_id
+    {
+        return Err(Error::SystemIdMismatch {
+            talker_sys_id,
+            tail_sys_id,
+        });
+    }
+
+    // Fallback: Use talker ID if the trailing system ID was omitted
+    gsa_data.system_id = gsa_data.system_id.or(system_id_from_talker);
+
+    Ok(gsa_data)
 }
 
 impl crate::generate::GenerateNmeaBody for GsaData {
@@ -298,7 +369,15 @@ impl crate::generate::GenerateNmeaBody for GsaData {
 
         // Field 18: System ID (NMEA 4.1+)
         if let Some(sid) = self.system_id {
-            write!(f, ",{}", sid)?;
+            let id: u8 = match sid {
+                GnssSystemId::Gps => 1,
+                GnssSystemId::Glonass => 2,
+                GnssSystemId::Galileo => 3,
+                GnssSystemId::Beidou => 4,
+                GnssSystemId::Qzss => 5,
+                GnssSystemId::NavIC => 6,
+            };
+            write!(f, ",{}", id)?;
         }
 
         Ok(())
@@ -323,6 +402,26 @@ mod tests {
     }
 
     #[test]
+    fn gsa_prn_capacity_preserves_every_field_and_rejects_overflow() {
+        let input = format!("{}1.0,0.8,0.6", "1,".repeat(MAX_PRNS));
+        assert_eq!(
+            gsa_prn_fields_parse(&input),
+            Ok((
+                "1.0,0.8,0.6",
+                Vec::from_slice(&[Some(1); MAX_PRNS]).unwrap()
+            )),
+        );
+        let overflow = format!("{}1.0,0.8,0.6", "1,".repeat(MAX_PRNS + 1));
+        assert_eq!(
+            gsa_prn_fields_parse(&overflow),
+            Err(Err::Failure(nom::error::Error::new(
+                "1,1.0,0.8,0.6",
+                ErrorKind::TooLarge
+            ))),
+        );
+    }
+
+    #[test]
     fn smoke_test_parse_gsa() {
         let s = parse_nmea_sentence("$GPGSA,A,3,,,,,,16,18,,22,24,,,3.6,2.1,2.2*3C").unwrap();
         let gsa = parse_gsa(s).unwrap();
@@ -334,7 +433,8 @@ mod tests {
                 pdop: Some(3.6),
                 hdop: Some(2.1),
                 vdop: Some(2.2),
-                system_id: None,
+                system_id: Some(GnssSystemId::Gps),
+                talker_id: heapless::String::try_from("GP").unwrap(),
             },
             gsa
         );
@@ -344,10 +444,13 @@ mod tests {
             "$BDGSA,A,3,214,,,,,,,,,,,,1.8,1.1,1.4*18",
             "$GNGSA,A,3,31,26,21,,,,,,,,,,3.77,2.55,2.77*1A",
             "$GNGSA,A,3,75,86,87,,,,,,,,,,3.77,2.55,2.77*1C",
+            "$GNGSA,A,3,23,02,27,10,08,,,,,,,,3.45,1.87,2.89,1*01",
+            "$GNGSA,A,3,,,,,,,,,,,,,3.45,1.87,2.89,4*0B",
             "$GPGSA,A,1,,,,*32",
+            "$GNGSA,A,1,,,,,,,,,,,,,,,,1*1D",
         ];
         for line in &gsa_examples {
-            println!("we parse line '{}'", line);
+            println!("we parse line '{line}'");
             let s = parse_nmea_sentence(line).unwrap();
             parse_gsa(s).unwrap();
         }
@@ -363,6 +466,7 @@ mod tests {
             hdop: Some(1.0),
             vdop: Some(1.3),
             system_id: None,
+            talker_id: heapless::String::try_from("GP").unwrap(),
         };
         let mut buf = heapless::String::<256>::new();
         crate::generate::generate_sentence("GP", &original, &mut buf).unwrap();
@@ -374,7 +478,7 @@ mod tests {
         assert_eq!(parsed.mode2, GsaMode2::Fix3D);
         assert_eq!(
             parsed.fix_sats_prn,
-            Vec::<u32, 18>::from_slice(&[19, 28, 14, 18, 27, 22, 31, 39]).unwrap()
+            Vec::<u32, MAX_PRNS>::from_slice(&[19, 28, 14, 18, 27, 22, 31, 39]).unwrap()
         );
         assert_eq!(parsed.pdop, Some(1.7));
         assert_eq!(parsed.hdop, Some(1.0));
@@ -390,12 +494,12 @@ mod tests {
         assert_eq!(gsa.mode2, GsaMode2::Fix3D);
         assert_eq!(
             gsa.fix_sats_prn,
-            Vec::<u32, 18>::from_slice(&[23, 31, 22, 16, 3, 7]).unwrap()
+            Vec::<u32, MAX_PRNS>::from_slice(&[23, 31, 22, 16, 3, 7]).unwrap()
         );
         assert_eq!(gsa.pdop, Some(1.8));
         assert_eq!(gsa.hdop, Some(1.1));
         assert_eq!(gsa.vdop, Some(1.4));
-        assert_eq!(gsa.system_id, Some(1));
+        assert_eq!(gsa.system_id, Some(GnssSystemId::Gps));
     }
 
     #[test]
@@ -407,7 +511,8 @@ mod tests {
             pdop: Some(1.8),
             hdop: Some(1.1),
             vdop: Some(1.4),
-            system_id: Some(3), // Galileo
+            system_id: Some(GnssSystemId::Galileo),
+            talker_id: heapless::String::try_from("GN").unwrap(),
         };
         let mut buf = heapless::String::<256>::new();
         crate::generate::generate_sentence("GN", &original, &mut buf).unwrap();
@@ -415,7 +520,7 @@ mod tests {
         let s = parse_nmea_sentence(&buf).unwrap();
         assert_eq!(s.checksum, s.calc_checksum());
         let parsed = parse_gsa(s).unwrap();
-        assert_eq!(parsed.system_id, Some(3));
+        assert_eq!(parsed.system_id, Some(GnssSystemId::Galileo));
         assert_eq!(parsed.fix_sats_prn, original.fix_sats_prn);
     }
 
@@ -429,6 +534,7 @@ mod tests {
             hdop: None,
             vdop: None,
             system_id: None,
+            talker_id: heapless::String::try_from("GP").unwrap(),
         };
         let mut buf = heapless::String::<256>::new();
         crate::generate::generate_sentence("GP", &original, &mut buf).unwrap();
@@ -439,5 +545,25 @@ mod tests {
         assert_eq!(parsed.mode1, GsaMode1::Manual);
         assert_eq!(parsed.mode2, GsaMode2::NoFix);
         assert!(parsed.fix_sats_prn.is_empty());
+    }
+
+    #[test]
+    fn test_parse_gsa_system_id_mismatch_error() {
+        // GP = GPS (1). The trailing field says 3 (Galileo).
+        let full_sentence = "$GPGSA,A,3,,,,,,,,,,,,3.6,2.1,2.2,3*3F";
+        let s = parse_nmea_sentence(full_sentence).unwrap();
+
+        let result = parse_gsa(s);
+
+        match result {
+            Err(Error::SystemIdMismatch {
+                talker_sys_id,
+                tail_sys_id,
+            }) => {
+                assert_eq!(talker_sys_id, GnssSystemId::Gps);
+                assert_eq!(tail_sys_id, GnssSystemId::Galileo);
+            }
+            _ => panic!("Expected Error::SystemIdMismatch, got {result:?}"),
+        }
     }
 }

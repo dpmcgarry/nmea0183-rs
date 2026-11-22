@@ -1,13 +1,13 @@
 //! The [`Nmea`] parser.
 
-use core::{fmt, mem, ops::BitOr};
+use core::{fmt, ops::BitOr};
 
 use chrono::{NaiveDate, NaiveTime};
 use heapless::{Deque, Vec};
 
 use crate::{
     Error, ParseResult, parse_str,
-    sentences::{rmc::RmcStatusOfFix, *},
+    sentences::{gnss_type::GnssSystemId, gsa::MAX_PRNS, rmc::RmcStatusOfFix, *},
 };
 
 #[cfg(feature = "serde")]
@@ -54,13 +54,15 @@ pub struct Nmea {
     pub pdop: Option<f32>,
     /// Geoid separation in meters
     pub geoid_separation: Option<f32>,
-    pub fix_satellites_prns: Option<Vec<u32, 18>>,
+    pub fix_satellites_prns: Option<Vec<(Option<GnssSystemId>, u32), MAX_PRNS>>,
     satellites_scan: [SatsPack; GnssType::COUNT],
     required_sentences_for_nav: SentenceMask,
     #[cfg_attr(feature = "defmt", defmt(Debug2Format))]
     last_fix_time: Option<NaiveTime>,
     last_txt: Option<TxtData>,
     sentences_for_this_time: SentenceMask,
+    pub gsa_cycle_complete: bool,
+    last_gsa_talker_id: Option<heapless::String<2>>,
 }
 
 impl<'a> Nmea {
@@ -136,7 +138,8 @@ impl<'a> Nmea {
         }
     }
 
-    /// Returns used satellites.
+    /// Returns satellites in view, keeping the most recent observation for each
+    /// GNSS constellation and PRN.
     ///
     /// The capacity is 72 (covering GPS 16 + GLONASS 12 + BeiDou 18 + Galileo 12 +
     /// NavIC 7 + QZSS 7). If more satellites are reported than fit, extras are
@@ -213,8 +216,73 @@ impl<'a> Nmea {
         self.geoid_separation = gns_data.geoid_separation;
     }
 
+    /// Detects GSA cycle boundaries and updates [`Self::gsa_cycle_complete`].
+    ///
+    /// GSA sentences arrive in sequences (one per constellation) followed by
+    /// a fix sentence that closes the cycle:
+    ///
+    /// ```text
+    /// $GPGSA,...   | GPS satellites used
+    /// $GLGSA,...   | GLONASS satellites used
+    /// $GAGSA,...   | Galileo satellites used
+    /// $GPGGA,...   | fix sentence: GSA cycle is now complete
+    /// ```
+    ///
+    /// Must be called on every parsed result before the match in both
+    /// [`Nmea::parse`] and [`Nmea::parse_for_fix`].
+    ///
+    /// `gsa_cycle_complete` is set to `true` on the first non-GSA sentence
+    /// after a GSA sequence, indicating that the accumulated satellite data
+    /// for the current epoch is stable and safe to read. It is `false` at all
+    /// other times.
+    fn update_gsa_state(&mut self, result: &ParseResult) {
+        if matches!(result, ParseResult::GSA(_)) {
+            self.gsa_cycle_complete = false;
+        } else if self.last_gsa_talker_id.is_some() {
+            // First non-GSA after a GSA sequence: the sequence just ended.
+            // Signal that fix_satellites_prns is now stable, and reset tracking
+            // so the next GSA sequence starts with a clean accumulator.
+            self.gsa_cycle_complete = true;
+            self.last_gsa_talker_id = None;
+        } else {
+            // Non-GSA with no preceding GSA sequence: nothing accumulated.
+            self.gsa_cycle_complete = false;
+        }
+    }
+
     fn merge_gsa_data(&mut self, gsa: GsaData) {
-        self.fix_satellites_prns = Some(gsa.fix_sats_prn);
+        // Reset for the first GSA in a sequence or a repeat of the previous talker.
+        // Repeated GN and PQ talkers accumulate because they can describe multiple constellations.
+        let is_accumulating_talker = matches!(gsa.talker_id.as_str(), "GN" | "PQ"); // "PQ" (Quectel vendor) behaves the same per gpsd
+
+        let should_reset = match &self.last_gsa_talker_id {
+            None => true,
+            Some(last) => last == &gsa.talker_id && !is_accumulating_talker,
+        };
+
+        if should_reset {
+            if let Some(prns) = &mut self.fix_satellites_prns {
+                prns.clear();
+            } else {
+                self.fix_satellites_prns = Some(Vec::new());
+            }
+        }
+
+        self.last_gsa_talker_id = Some(gsa.talker_id.clone());
+
+        if let Some(prns) = &mut self.fix_satellites_prns {
+            for prn in gsa.fix_sats_prn {
+                let sat = (gsa.system_id, prn);
+                if !prns.contains(&sat) {
+                    // SAFETY: The maximum PRNS is set to the realistic maximum + 10 for headroom
+                    // if we exceed that, it should be increased further.
+                    if prns.push(sat).is_err() {
+                        panic!("PRN list overflow");
+                    }
+                }
+            }
+        }
+
         self.hdop = gsa.hdop;
         self.vdop = gsa.vdop;
         self.pdop = gsa.pdop;
@@ -252,7 +320,10 @@ impl<'a> Nmea {
     ///
     /// The type of sentence is returned if implemented and valid.
     pub fn parse(&mut self, sentence: &'a str) -> Result<SentenceType, Error<'a>> {
-        match parse_str(sentence)? {
+        let result = parse_str(sentence)?;
+        self.update_gsa_state(&result);
+
+        match result {
             ParseResult::VTG(vtg) => {
                 self.merge_vtg_data(vtg);
                 Ok(SentenceType::VTG)
@@ -301,10 +372,48 @@ impl<'a> Nmea {
     }
 
     fn new_tick(&mut self) {
-        let old = mem::take(self);
-        self.satellites_scan = old.satellites_scan;
-        self.required_sentences_for_nav = old.required_sentences_for_nav;
-        self.last_fix_time = old.last_fix_time;
+        let Self {
+            fix_time,
+            fix_date,
+            fix_type,
+            latitude,
+            longitude,
+            altitude,
+            speed_over_ground,
+            true_course,
+            num_of_fix_satellites,
+            hdop,
+            vdop,
+            pdop,
+            geoid_separation,
+            fix_satellites_prns,
+            satellites_scan: _,
+            required_sentences_for_nav: _,
+            last_fix_time: _,
+            last_txt,
+            sentences_for_this_time,
+            gsa_cycle_complete,
+            last_gsa_talker_id,
+        } = self;
+
+        *fix_time = None;
+        *fix_date = None;
+        *fix_type = None;
+        *latitude = None;
+        *longitude = None;
+        *altitude = None;
+        *speed_over_ground = None;
+        *true_course = None;
+        *num_of_fix_satellites = None;
+        *hdop = None;
+        *vdop = None;
+        *pdop = None;
+        *geoid_separation = None;
+        *fix_satellites_prns = None;
+        *last_txt = None;
+        *sentences_for_this_time = Default::default();
+        *gsa_cycle_complete = false;
+        *last_gsa_talker_id = None;
     }
 
     fn clear_position_info(&mut self) {
@@ -313,7 +422,10 @@ impl<'a> Nmea {
     }
 
     pub fn parse_for_fix(&mut self, xs: &'a str) -> Result<FixType, Error<'a>> {
-        match parse_str(xs)? {
+        let result = parse_str(xs)?;
+        self.update_gsa_state(&result);
+
+        match result {
             ParseResult::GSA(gsa) => {
                 self.merge_gsa_data(gsa);
                 return Ok(FixType::Invalid);
@@ -509,9 +621,8 @@ impl fmt::Display for Nmea {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Default)]
 struct SatsPack {
-    /// max number of visible GNSS satellites per hemisphere, assuming global coverage
-    /// GPS: 16, GLONASS: 12, BeiDou: 18, Galileo: 12, NavIC: 7, QZSS: 7
-    /// => 72 total Satellites => max 18 rows of data
+    /// Implementation capacity: 15 sentence rows per constellation, with up to
+    /// four observations per row. `Nmea::satellites()` returns at most 72 entries.
     #[cfg_attr(feature = "serde", serde(with = "serde_deq"))]
     #[cfg_attr(feature = "defmt", defmt(Debug2Format))]
     data: Deque<Vec<Option<Satellite>, 4>, 15>,
@@ -568,13 +679,17 @@ mod serde_deq {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Clone, PartialEq)]
-/// Satellite information
+/// An identified satellite observation.
+///
+/// GSV observations without a satellite ID cannot be represented as a
+/// `Satellite` and are discarded by the GSV parser.
 pub struct Satellite {
     pub(crate) gnss_type: GnssType,
     pub(crate) prn: u32,
     pub(crate) elevation: Option<f32>,
     pub(crate) azimuth: Option<f32>,
     pub(crate) snr: Option<f32>,
+    pub(crate) signal_id: Option<u8>,
 }
 
 impl Satellite {
@@ -598,18 +713,27 @@ impl Satellite {
     pub fn snr(&self) -> Option<f32> {
         self.snr
     }
+    /// Raw NMEA 4.10+ Signal ID from this observation's GSV sentence.
+    /// The wire field is one hexadecimal digit, returned as `0x0..=0xF`
+    /// (wire `B` becomes `Some(11)`), without translation to a u-blox signal ID.
+    /// `None` means absent or empty, `Some(0)` means "all signals".
+    /// Other meanings depend on [`Self::gnss_type`].
+    pub fn signal_id(&self) -> Option<u8> {
+        self.signal_id
+    }
 }
 
 impl fmt::Display for Satellite {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "{}: {} elv: {} ath: {} snr: {}",
+            "{}: {} elv: {} ath: {} snr: {} signal: {:?}",
             self.gnss_type,
             self.prn,
             format_args!("{:?}", self.elevation),
             format_args!("{:?}", self.azimuth),
             format_args!("{:?}", self.snr),
+            self.signal_id,
         )
     }
 }
@@ -618,8 +742,8 @@ impl fmt::Debug for Satellite {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "[{:?},{:?},{:?},{:?},{:?}]",
-            self.gnss_type, self.prn, self.elevation, self.azimuth, self.snr
+            "[{:?},{:?},{:?},{:?},{:?},{:?}]",
+            self.gnss_type, self.prn, self.elevation, self.azimuth, self.snr, self.signal_id
         )
     }
 }
@@ -1424,9 +1548,12 @@ mod tests {
     fn test_checksum() {
         let valid = "$GNGSA,A,1,,,,,,,,,,,,,99.99,99.99,99.99*2E";
         let invalid = "$GNZDA,165118.00,13,05,2016,00,00*71";
-        assert_eq!(checksum(valid[1..valid.len() - 3].as_bytes().iter()), 0x2E);
+        assert_eq!(
+            checksum(&mut valid.as_bytes()[1..valid.len() - 3].iter()),
+            0x2E
+        );
         assert_ne!(
-            checksum(invalid[1..invalid.len() - 3].as_bytes().iter()),
+            checksum(&mut invalid.as_bytes()[1..invalid.len() - 3].iter()),
             0x71
         );
     }

@@ -12,6 +12,7 @@ pub mod dbs;
 pub mod dbt;
 pub mod dpt;
 pub mod dsc;
+pub(crate) mod float;
 pub mod gbs;
 pub mod gga;
 pub mod gll;

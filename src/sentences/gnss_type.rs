@@ -74,3 +74,63 @@ impl fmt::Display for GnssType {
         }
     }
 }
+
+impl From<GnssSystemId> for GnssType {
+    fn from(id: GnssSystemId) -> Self {
+        match id {
+            GnssSystemId::Gps => Self::Gps,
+            GnssSystemId::Glonass => Self::Glonass,
+            GnssSystemId::Galileo => Self::Galileo,
+            GnssSystemId::Beidou => Self::Beidou,
+            GnssSystemId::Qzss => Self::Qzss,
+            GnssSystemId::NavIC => Self::NavIC,
+        }
+    }
+}
+
+define_enum_with_count!(
+    /// Supported GNSS types for System ID (GSA NMEA 4.1+)
+    enum GnssSystemId {
+        /// Global Positioning System (GPS) from the United States.
+        Gps,
+        /// Globalnaya Navigazionnaya Sputnikovaya Sistema (GLONASS) from Russia.
+        Glonass,
+        /// European Global Navigation System (Galileo) from Europe.
+        Galileo,
+        /// BeiDou Navigation Satellite System (BDS) from China.
+        Beidou,
+        /// Quasi-Zenith Satellite System (QZSS) from Japan, System ID 5.
+        Qzss,
+        /// Navigation with Indian Constellation (NavIC), System ID 6.
+        NavIC,
+    }
+);
+
+impl fmt::Display for GnssSystemId {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Self::Beidou => write!(f, "Beidou"),
+            Self::Galileo => write!(f, "Galileo"),
+            Self::Gps => write!(f, "GPS"),
+            Self::Glonass => write!(f, "GLONASS"),
+            Self::Qzss => write!(f, "QZSS"),
+            Self::NavIC => write!(f, "NavIC"),
+        }
+    }
+}
+
+impl TryFrom<u8> for GnssSystemId {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Gps),
+            2 => Ok(Self::Glonass),
+            3 => Ok(Self::Galileo),
+            4 => Ok(Self::Beidou),
+            5 => Ok(Self::Qzss),
+            6 => Ok(Self::NavIC),
+            _ => Err(()),
+        }
+    }
+}

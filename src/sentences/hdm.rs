@@ -5,7 +5,7 @@ use nom::{
     combinator::{map_res, opt},
 };
 
-use super::utils::parse_float_num;
+use super::float::parse_f32;
 use crate::{Error, NmeaSentence, ParseResult, SentenceType};
 
 /// HDM - Heading - Magnetic
@@ -48,7 +48,7 @@ pub fn parse_hdm(sentence: NmeaSentence<'_>) -> Result<HdmData, Error<'_>> {
 }
 
 fn do_parse_hdm(i: &str) -> IResult<&str, HdmData> {
-    let (i, heading) = opt(map_res(take_until(","), parse_float_num::<f32>)).parse(i)?;
+    let (i, heading) = opt(map_res(take_until(","), parse_f32)).parse(i)?;
     let (i, _) = char(',').parse(i)?;
     let (i, _) = char('M').parse(i)?;
     Ok((i, HdmData { heading }))

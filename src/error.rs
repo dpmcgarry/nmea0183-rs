@@ -1,6 +1,9 @@
 use core::fmt;
 
-use crate::{SentenceType, sentences::GnssType};
+use crate::{
+    SentenceType,
+    sentences::{GnssType, gnss_type::GnssSystemId},
+};
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq)]
@@ -40,6 +43,10 @@ pub enum Error<'a> {
     UnknownTalkerId { expected: &'a str, found: &'a str },
     /// The current sentence is parsable but the feature has been disabled.
     DisabledSentence(SentenceType),
+    SystemIdMismatch {
+        talker_sys_id: GnssSystemId,
+        tail_sys_id: GnssSystemId,
+    },
 }
 
 impl<'a> From<nom::Err<nom::error::Error<&'a str>>> for Error<'a> {
@@ -107,6 +114,13 @@ impl fmt::Display for Error<'_> {
                     sentence
                 )
             }
+            Error::SystemIdMismatch {
+                talker_sys_id,
+                tail_sys_id,
+            } => write!(
+                f,
+                "System ID Mismatch: Talker ID implies '{talker_sys_id}', but payload specifies '{tail_sys_id}'"
+            ),
         }
     }
 }

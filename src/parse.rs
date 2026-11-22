@@ -2,10 +2,11 @@ use core::str;
 
 use nom::{
     IResult, Parser as _,
-    bytes::complete::{take, take_until},
+    branch::alt,
+    bytes::complete::{tag, take, take_until},
     character::complete::{char, one_of},
-    combinator::map_res,
-    sequence::preceded,
+    combinator::{all_consuming, map_res, opt},
+    sequence::{preceded, terminated},
 };
 
 use cfg_if::cfg_if;
@@ -71,10 +72,10 @@ fn parse_checksum(i: &str) -> IResult<&str, u8> {
 
 fn parse_sentence_type(i: &str) -> IResult<&str, SentenceType> {
     // Try 4-character sentence types first (e.g. RMCE, GGAE), then fall back to 3
-    if i.len() >= 4 {
-        if let Ok(st) = SentenceType::try_from(&i[..4]) {
-            return Ok((&i[4..], st));
-        }
+    if i.len() >= 4
+        && let Ok(st) = SentenceType::try_from(&i[..4])
+    {
+        return Ok((&i[4..], st));
     }
     map_res(take(3usize), |sentence_type: &str| {
         SentenceType::try_from(sentence_type).map_err(|_| "Unknown sentence type")
@@ -104,7 +105,12 @@ pub fn parse_nmea_sentence(sentence: &str) -> core::result::Result<NmeaSentence<
     if sentence.len() > SENTENCE_MAX_LEN {
         Err(Error::SentenceLength(sentence.len()))
     } else {
-        Ok(do_parse_nmea_sentence(sentence)?.1)
+        Ok(all_consuming(terminated(
+            do_parse_nmea_sentence,
+            opt(alt((tag("\r\n"), tag("\n"), tag("\r")))),
+        ))
+        .parse(sentence)?
+        .1)
     }
 }
 
@@ -247,7 +253,7 @@ pub fn parse_bytes(sentence_input: &[u8]) -> Result<ParseResult, Error<'_>> {
 
 /// Parse a NMEA 0183 sentence from a string slice and extract data from it.
 ///
-/// Should not contain `\r\n` ending.
+/// Accepts one optional LF, CRLF or CR terminator.
 ///
 /// # Errors
 ///

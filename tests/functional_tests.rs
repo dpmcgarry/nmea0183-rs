@@ -1,7 +1,13 @@
 use approx::assert_relative_eq;
 use chrono::NaiveTime;
 use helpers::format_satellites;
-use nmea::{sentences::fix_type::FixType, *};
+use nmea::{
+    sentences::{
+        fix_type::FixType,
+        gnss_type::{GnssSystemId, GnssType},
+    },
+    *,
+};
 
 mod helpers;
 
@@ -134,6 +140,117 @@ fn test_gsv() {
         ],
         format_satellites(nmea.satellites())
     );
+}
+
+#[test]
+fn test_gsv_signal_id() {
+    // From a Quectel BG96
+    let sentences = [
+        "$GPGSV,6,1,24,05,13.4,30.9,26.8,16,64.7,258.8,32.2,18,67.5,83.0,31.6,08,7.7,279.8,,1*46",
+        "$GPGSV,6,2,24,10,8.4,165.9,,13,1.4,50.6,,15,5.6,80.2,,20,5.6,56.3,,1*58",
+        "$GPGSV,6,3,24,23,33.8,139.2,,26,49.9,195.5,,27,38.0,277.0,,29,15.5,95.6,,1*53",
+        "$GPGSV,6,4,24,31,4.9,215.2,,33,,,33.9,38,,,33.7,39,,,34.0,1*7D",
+        "$GPGSV,6,5,24,40,,,33.8,41,,,33.8,42,,,33.9,46,,,35.1,1*6A",
+        "$GPGSV,6,6,24,48,,,33.7,49,,,34.2,50,,,34.8,51,,,34.1,1*69",
+        "$GAGSV,3,1,12,02,14.8,144.8,,04,7.7,15.5,,06,3.5,38.0,,09,,,,7*43",
+        "$GAGSV,3,2,12,15,32.3,210.9,,19,3.5,324.8,,21,3.5,313.6,,27,51.3,291.1,,7*75",
+        "$GAGSV,3,3,12,28,6.3,351.6,,30,65.4,187.0,,34,74.5,132.2,,36,32.3,53.4,,7*72",
+    ];
+    let mut nmea = Nmea::default();
+    for (idx, sentence) in sentences.iter().enumerate() {
+        let (gnss_type, signal_id, sentence_num, number_of_sentences, sats_in_view) = if idx < 6 {
+            (GnssType::Gps, 1, idx + 1, 6, 24)
+        } else {
+            (GnssType::Galileo, 7, idx - 5, 3, 12)
+        };
+        let ParseResult::GSV(data) = parse_str(sentence).unwrap() else {
+            panic!("Expected GSV data");
+        };
+        assert_eq!(data.gnss_type, gnss_type);
+        assert_eq!(data.signal_id, Some(signal_id));
+        assert_eq!(data.sentence_num, sentence_num as u16);
+        assert_eq!(data.number_of_sentences, number_of_sentences);
+        assert_eq!(data.sats_in_view, sats_in_view);
+        assert_eq!(data.sats_info.iter().flatten().count(), 4);
+        assert!(
+            data.sats_info
+                .iter()
+                .flatten()
+                .all(|sat| { sat.gnss_type() == gnss_type && sat.signal_id() == Some(signal_id) })
+        );
+        nmea.parse(sentence).unwrap();
+    }
+
+    let satellites = nmea.satellites();
+    assert_eq!(satellites.len(), 36);
+    assert_eq!(
+        satellites
+            .iter()
+            .filter(|sat| sat.gnss_type() == GnssType::Gps)
+            .count(),
+        24
+    );
+    assert_eq!(
+        satellites
+            .iter()
+            .filter(|sat| sat.gnss_type() == GnssType::Galileo)
+            .count(),
+        12
+    );
+    for sat in &satellites {
+        let expected_signal_id = match sat.gnss_type() {
+            GnssType::Gps => 1,
+            GnssType::Galileo => 7,
+            _ => panic!("Unexpected constellation"),
+        };
+        assert_eq!(sat.signal_id(), Some(expected_signal_id));
+    }
+    let sat = satellites
+        .iter()
+        .find(|sat| sat.gnss_type() == GnssType::Galileo && sat.prn() == 9)
+        .unwrap();
+    assert_eq!(sat.elevation(), None);
+    assert_eq!(sat.azimuth(), None);
+    assert_eq!(sat.snr(), None);
+}
+
+#[test]
+fn test_quectel_gsv_system_id() {
+    let examples = [
+        // Real Quectel BeiDou example from gpsd's driver_nmea0183.c.
+        (
+            "$PQGSV,4,2,15,09,16,120,,10,26,049,,16,07,123,,19,34,212,,0,4*62",
+            GnssType::Beidou,
+        ),
+        // Constructed System ID 5 variant, with its checksum recalculated.
+        (
+            "$PQGSV,4,2,15,09,16,120,,10,26,049,,16,07,123,,19,34,212,,0,5*63",
+            GnssType::Qzss,
+        ),
+    ];
+    for (sentence, gnss_type) in examples {
+        let ParseResult::GSV(data) = parse_str(sentence).unwrap() else {
+            panic!("Expected GSV data");
+        };
+        assert_eq!(data.gnss_type, gnss_type);
+        assert_eq!(data.signal_id, Some(0));
+        assert_eq!(data.sats_info.iter().flatten().count(), 4);
+        assert!(
+            data.sats_info
+                .iter()
+                .flatten()
+                .all(|sat| { sat.gnss_type() == gnss_type && sat.signal_id() == Some(0) })
+        );
+        let mut nmea = Nmea::default();
+        nmea.parse(sentence).unwrap();
+        let satellites = nmea.satellites();
+        assert_eq!(satellites.len(), 4);
+        assert!(
+            satellites
+                .iter()
+                .all(|sat| { sat.gnss_type() == gnss_type && sat.signal_id() == Some(0) })
+        );
+    }
 }
 
 #[test]
@@ -470,4 +587,222 @@ fn test_gll() {
     assert_eq!(22, nmea.fix_timestamp().unwrap().hour());
     assert_eq!(54, nmea.fix_timestamp().unwrap().minute());
     assert_eq!(44, nmea.fix_timestamp().unwrap().second());
+}
+
+fn sort_prns(v: &mut [(Option<GnssSystemId>, u32)]) {
+    v.sort_by(|a, b| {
+        let a_key = (a.0.map(|s| s as u8), a.1);
+        let b_key = (b.0.map(|s| s as u8), b.1);
+        a_key.cmp(&b_key)
+    });
+}
+
+fn collect_prns(nmea: &Nmea) -> Vec<(Option<GnssSystemId>, u32)> {
+    nmea.fix_satellites_prns
+        .as_ref()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect()
+}
+
+fn assert_prns_eq(nmea: &Nmea, mut expected: Vec<(Option<GnssSystemId>, u32)>, cycle: usize) {
+    assert!(
+        nmea.gsa_cycle_complete,
+        "Cycle {cycle}: expected completed GSA cycle"
+    );
+
+    let mut actual = collect_prns(nmea);
+
+    sort_prns(&mut expected);
+    sort_prns(&mut actual);
+
+    assert_eq!(actual, expected, "Cycle {cycle}: PRN mismatch");
+}
+
+// From MediaTek Airoha AG3352b GNSS
+#[test]
+#[cfg(all(feature = "GGA", feature = "GSA", feature = "GSV", feature = "RMC"))]
+fn test_gngsa_single_cycle_multi_constellation_accumulation() {
+    use nmea::sentences::gnss_type::GnssSystemId;
+
+    let mut nmea = Nmea::default();
+
+    // A complete cycle from a multi-constellation receiver.
+    // Four GNGSA sentences arrive back-to-back, one per constellation:
+    // GPS=1, GLONASS=2, Galileo=3, BeiDou=4
+    // followed by a GGA fix sentence which finalizes the cycle.
+    let sentences = [
+        "$GNGSA,A,3,04,01,03,31,06,02,,,,,,,1.12,0.79,0.79,1*03",
+        "$GNGSA,A,3,78,,,,,,,,,,,,1.12,0.79,0.79,2*0F",
+        "$GNGSA,A,3,03,08,15,,,,,,,,,,1.12,0.79,0.79,3*0E",
+        "$GNGSA,A,3,34,21,19,22,,,,,,,,,1.12,0.79,0.79,4*0A",
+        "$GNGGA,201209.000,5543.4995,N,01221.2299,E,1,14,0.79,75.9,M,41.7,M,,*4E",
+    ];
+
+    for s in &sentences {
+        nmea.parse(s).unwrap();
+    }
+
+    // GGA is the first non-GSA after the sequence,
+    // so cycle should now be considered complete.
+    assert!(nmea.gsa_cycle_complete);
+
+    let expected = vec![
+        // GPS (system_id=1 - GnssSystemId::Gps)
+        (Some(GnssSystemId::Gps), 4),
+        (Some(GnssSystemId::Gps), 1),
+        (Some(GnssSystemId::Gps), 3),
+        (Some(GnssSystemId::Gps), 31),
+        (Some(GnssSystemId::Gps), 6),
+        (Some(GnssSystemId::Gps), 2),
+        // GLONASS (system_id=2 - GnssSystemId::Glonass)
+        (Some(GnssSystemId::Glonass), 78),
+        // Galileo (system_id=3 - GnssSystemId::Galileo)
+        (Some(GnssSystemId::Galileo), 3),
+        (Some(GnssSystemId::Galileo), 8),
+        (Some(GnssSystemId::Galileo), 15),
+        // BeiDou (system_id=4 - GnssSystemId::Beidou)
+        (Some(GnssSystemId::Beidou), 34),
+        (Some(GnssSystemId::Beidou), 21),
+        (Some(GnssSystemId::Beidou), 19),
+        (Some(GnssSystemId::Beidou), 22),
+    ];
+
+    // Total: 6 + 1 + 3 + 4 = 14 satellites
+    // This must match the GGA reported fix satellite count.
+    assert_prns_eq(&nmea, expected, 1);
+
+    assert_eq!(nmea.num_of_fix_satellites.unwrap(), 14);
+}
+
+// From MediaTek Airoha AG3352b GNSS
+#[test]
+#[cfg(all(
+    feature = "GGA",
+    feature = "GSA",
+    feature = "GSV",
+    feature = "RMC",
+    feature = "GLL"
+))]
+fn test_gngsa_multi_cycle_multi_constellation_accumulation() {
+    let mut nmea = Nmea::default();
+
+    // Cycle 1
+    for s in [
+        "$GNGGA,201153.000,5543.5012,N,01221.2129,E,1,15,0.77,68.8,M,41.7,M,,*4F",
+        "$GNGLL,5543.5012,N,01221.2129,E,201153.000,A,A*4A",
+        "$GNGSA,A,3,04,01,03,19,28,31,06,02,,,,,1.11,0.77,0.80,1*0A",
+        "$GNGSA,A,3,,,,,,,,,,,,,1.11,0.77,0.80,2*0B",
+        "$GNGSA,A,3,03,08,15,,,,,,,,,,1.11,0.77,0.80,3*05",
+        "$GNGSA,A,3,34,21,44,22,,,,,,,,,1.11,0.77,0.80,4*09",
+        "$GNRMC,201153.000,A,5543.5012,N,01221.2129,E,0.00,175.67,070326,,,A,V*05",
+    ] {
+        nmea.parse(s).unwrap();
+    }
+    assert!(nmea.gsa_cycle_complete, "Cycle should complete");
+
+    assert_prns_eq(
+        &nmea,
+        vec![
+            // GPS
+            (Some(GnssSystemId::Gps), 4),
+            (Some(GnssSystemId::Gps), 1),
+            (Some(GnssSystemId::Gps), 3),
+            (Some(GnssSystemId::Gps), 19),
+            (Some(GnssSystemId::Gps), 28),
+            (Some(GnssSystemId::Gps), 31),
+            (Some(GnssSystemId::Gps), 6),
+            (Some(GnssSystemId::Gps), 2),
+            // Galileo
+            (Some(GnssSystemId::Galileo), 3),
+            (Some(GnssSystemId::Galileo), 8),
+            (Some(GnssSystemId::Galileo), 15),
+            // BeiDou
+            (Some(GnssSystemId::Beidou), 34),
+            (Some(GnssSystemId::Beidou), 21),
+            (Some(GnssSystemId::Beidou), 44),
+            (Some(GnssSystemId::Beidou), 22),
+        ],
+        1,
+    );
+
+    // Cycle 2
+    for s in [
+        "$GNGGA,201154.000,5543.5022,N,01221.2136,E,1,16,0.76,69.0,M,41.7,M,,*4E",
+        "$GNGLL,5543.5022,N,01221.2136,E,201154.000,A,A*40",
+        "$GNGSA,A,3,04,01,19,03,31,28,06,02,,,,,1.10,0.76,0.80,1*0A",
+        "$GNGSA,A,3,,,,,,,,,,,,,1.10,0.76,0.80,2*0B",
+        "$GNGSA,A,3,15,08,03,,,,,,,,,,1.10,0.76,0.80,3*05",
+        "$GNGSA,A,3,12,34,21,44,22,,,,,,,,1.10,0.76,0.80,4*0A",
+        "$GNRMC,201154.000,A,5543.5022,N,01221.2136,E,0.00,21.34,070326,,,A,V*39",
+    ] {
+        nmea.parse(s).unwrap();
+    }
+    assert!(nmea.gsa_cycle_complete, "Cycle should complete");
+
+    assert_prns_eq(
+        &nmea,
+        vec![
+            // GPS
+            (Some(GnssSystemId::Gps), 4),
+            (Some(GnssSystemId::Gps), 1),
+            (Some(GnssSystemId::Gps), 19),
+            (Some(GnssSystemId::Gps), 3),
+            (Some(GnssSystemId::Gps), 31),
+            (Some(GnssSystemId::Gps), 28),
+            (Some(GnssSystemId::Gps), 6),
+            (Some(GnssSystemId::Gps), 2),
+            // Galileo
+            (Some(GnssSystemId::Galileo), 15),
+            (Some(GnssSystemId::Galileo), 8),
+            (Some(GnssSystemId::Galileo), 3),
+            // BeiDou
+            (Some(GnssSystemId::Beidou), 12),
+            (Some(GnssSystemId::Beidou), 34),
+            (Some(GnssSystemId::Beidou), 21),
+            (Some(GnssSystemId::Beidou), 44),
+            (Some(GnssSystemId::Beidou), 22),
+        ],
+        2,
+    );
+
+    // Cycle 3
+    for s in [
+        "$GNGGA,201209.000,5543.4995,N,01221.2299,E,1,14,0.79,75.9,M,41.7,M,,*4E",
+        "$GNGLL,5543.4995,N,01221.2299,E,201209.000,A,A*49",
+        "$GNGSA,A,3,04,01,03,31,06,02,,,,,,,1.12,0.79,0.79,1*03",
+        "$GNGSA,A,3,78,,,,,,,,,,,,1.12,0.79,0.79,2*0F",
+        "$GNGSA,A,3,03,08,15,,,,,,,,,,1.12,0.79,0.79,3*0E",
+        "$GNGSA,A,3,34,21,19,22,,,,,,,,,1.12,0.79,0.79,4*0A",
+        "$GNRMC,201209.000,A,5543.4995,N,01221.2299,E,3.65,87.89,070326,,,A,V*3A",
+    ] {
+        nmea.parse(s).unwrap();
+    }
+    assert!(nmea.gsa_cycle_complete, "Cycle should complete");
+
+    assert_prns_eq(
+        &nmea,
+        vec![
+            // GPS
+            (Some(GnssSystemId::Gps), 4),
+            (Some(GnssSystemId::Gps), 1),
+            (Some(GnssSystemId::Gps), 3),
+            (Some(GnssSystemId::Gps), 31),
+            (Some(GnssSystemId::Gps), 6),
+            (Some(GnssSystemId::Gps), 2),
+            // GLONASS
+            (Some(GnssSystemId::Glonass), 78),
+            // Galileo
+            (Some(GnssSystemId::Galileo), 3),
+            (Some(GnssSystemId::Galileo), 8),
+            (Some(GnssSystemId::Galileo), 15),
+            // BeiDou
+            (Some(GnssSystemId::Beidou), 34),
+            (Some(GnssSystemId::Beidou), 21),
+            (Some(GnssSystemId::Beidou), 19),
+            (Some(GnssSystemId::Beidou), 22),
+        ],
+        3,
+    );
 }
