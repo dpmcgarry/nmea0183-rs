@@ -41,13 +41,11 @@ pub fn parse_hms(i: &str) -> IResult<&str, NaiveTime> {
             if sec >= 60. {
                 return Err("Invalid time: sec >= 60");
             }
-            NaiveTime::from_hms_nano_opt(
-                hour,
-                minutes,
-                sec.trunc() as u32,
-                (sec.fract() * 1_000_000_000f64).round() as u32,
-            )
-            .ok_or("Invalid time")
+            // Clamp so rounding never yields 1_000_000_000 ns, which chrono
+            // would treat as a leap second.
+            let nano = ((sec.fract() * 1_000_000_000f64).round() as u32).min(999_999_999);
+            NaiveTime::from_hms_nano_opt(hour, minutes, sec.trunc() as u32, nano)
+                .ok_or("Invalid time")
         },
     )
     .parse(i)
@@ -285,6 +283,16 @@ mod tests {
         assert_eq!(time.minute(), 56);
         assert_eq!(time.second(), 19);
         assert_eq!(time.nanosecond(), 500_000_000);
+    }
+
+    #[test]
+    fn test_parse_hms_fraction_rounding_does_not_reach_leap_second() {
+        use chrono::Timelike;
+        let (_, time) = parse_hms("125959.9999999999,").unwrap();
+        assert_eq!(time.hour(), 12);
+        assert_eq!(time.minute(), 59);
+        assert_eq!(time.second(), 59);
+        assert_eq!(time.nanosecond(), 999_999_999);
     }
 
     #[test]
